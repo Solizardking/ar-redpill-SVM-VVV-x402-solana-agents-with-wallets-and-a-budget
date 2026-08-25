@@ -1,0 +1,5 @@
+x402[svm]>=2.20
+solana>=0.36,<0.38
+solders>=0.27
+base58
+requests
