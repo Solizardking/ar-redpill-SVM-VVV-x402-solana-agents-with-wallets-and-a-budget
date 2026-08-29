@@ -3,3 +3,4 @@ solana>=0.36,<0.38
 solders>=0.27
 base58
 requests
+websocket-client>=1.8
