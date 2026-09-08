@@ -13,9 +13,10 @@ with redirect_stdout(io.StringIO()):
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, body):
+    def __init__(self, status_code: int, body, headers=None):
         self.status_code = status_code
         self._body = body
+        self.headers = headers or {}
         self.content = b"json" if body is not None else b""
 
     def json(self):
@@ -225,16 +226,8 @@ class SaidIdentityTests(unittest.TestCase):
         with patch.object(
             agent.requests,
             "get",
-            return_value=FakeResponse(402, {}),
-        ) as get:
-            get.return_value.headers = {"payment-required": encoded}  # type: ignore[attr-defined]
-            # FakeResponse has no headers; wrap it.
-        class Screen402(FakeResponse):
-            def __init__(self):
-                super().__init__(402, {})
-                self.headers = {"payment-required": encoded}
-
-        with patch.object(agent.requests, "get", return_value=Screen402()):
+            return_value=FakeResponse(402, {}, {"payment-required": encoded}),
+        ):
             with self.assertRaises(agent.SaidPaymentWall):
                 agent.said_screen("11111111111111111111111111111111", pay=False)
 
