@@ -176,6 +176,82 @@ class BudgetTests(unittest.TestCase):
                 agent.validated_budget(value)
 
 
+class SaidIdentityTests(unittest.TestCase):
+    def test_api_key_is_sent_as_x_api_key(self):
+        with patch.object(agent, "SAID_API_KEY", "test-said-key"):
+            self.assertEqual(agent.said_headers()["X-API-Key"], "test-said-key")
+        with patch.object(agent, "SAID_API_KEY", ""):
+            self.assertNotIn("X-API-Key", agent.said_headers())
+
+    def test_screen_rail_rejects_non_usdc_and_over_cap(self):
+        required = {
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": agent.NETWORK,
+                    "amount": "1000",
+                    "asset": "11111111111111111111111111111111",
+                    "payTo": "3Q6QAbCWmqJfXthcXxsxpj2SXvDcmDsJJsevwMgC8BrU",
+                    "extra": {"feePayer": "CjNFTjvBhbJJd2B5ePPMHRLx1ELZpa8dwQgGL727eKww"},
+                }
+            ]
+        }
+        with self.assertRaisesRegex(RuntimeError, "exact USDC"):
+            agent._said_screen_rail(required)
+        required["accepts"][0]["asset"] = agent.USDC_MINT
+        required["accepts"][0]["amount"] = "10001"
+        with self.assertRaisesRegex(RuntimeError, "cap is 10000"):
+            agent._said_screen_rail(required)
+
+    def test_caution_verdicts_block_and_402_is_a_wall(self):
+        self.assertTrue(agent.should_block_counterparty("caution"))
+        self.assertFalse(agent.should_block_counterparty("allow"))
+        encoded = __import__("base64").b64encode(
+            __import__("json").dumps(
+                {
+                    "accepts": [
+                        {
+                            "scheme": "exact",
+                            "network": agent.NETWORK,
+                            "amount": "1000",
+                            "asset": agent.USDC_MINT,
+                            "payTo": "3Q6QAbCWmqJfXthcXxsxpj2SXvDcmDsJJsevwMgC8BrU",
+                            "extra": {"feePayer": "CjNFTjvBhbJJd2B5ePPMHRLx1ELZpa8dwQgGL727eKww"},
+                        }
+                    ]
+                }
+            ).encode()
+        ).decode()
+        with patch.object(
+            agent.requests,
+            "get",
+            return_value=FakeResponse(402, {}),
+        ) as get:
+            get.return_value.headers = {"payment-required": encoded}  # type: ignore[attr-defined]
+            # FakeResponse has no headers; wrap it.
+        class Screen402(FakeResponse):
+            def __init__(self):
+                super().__init__(402, {})
+                self.headers = {"payment-required": encoded}
+
+        with patch.object(agent.requests, "get", return_value=Screen402()):
+            with self.assertRaises(agent.SaidPaymentWall):
+                agent.said_screen("11111111111111111111111111111111", pay=False)
+
+    def test_register_posts_pending_identity_for_this_wallet(self):
+        with patch.object(
+            agent.requests,
+            "post",
+            return_value=FakeResponse(200, {"success": True, "status": "PENDING", "wallet": str(agent.signer.address)}),
+        ) as post:
+            out = agent.said_register()
+        self.assertEqual(out["status"], "PENDING")
+        args, kwargs = post.call_args
+        self.assertIn("/api/register/pending", args[0])
+        self.assertEqual(kwargs["json"]["wallet"], str(agent.signer.address))
+        self.assertIn("x402", kwargs["json"]["capabilities"])
+
+
 class DeskSafetyTests(unittest.TestCase):
     def test_bearer_token_requires_https_except_on_loopback(self):
         with self.assertRaisesRegex(ValueError, "must use HTTPS"):

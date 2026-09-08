@@ -79,6 +79,14 @@ PUMP_RELAY_WS_URL = (
 )
 DESK_API_URL = os.environ.get("DESK_API_URL", "http://127.0.0.1:3000").rstrip("/")
 AUTO_REFILL = os.environ.get("AUTO_REFILL", "").strip() in {"1", "true", "TRUE", "yes"}
+SAID_API_BASE = os.environ.get("SAID_API_BASE", "https://api.saidprotocol.com").rstrip("/")
+SAID_API_KEY = os.environ.get("SAID_API_KEY", "").strip()
+SAID_AGENT_NAME = os.environ.get("SAID_AGENT_NAME", "SOLGPT X402 Desk")
+SAID_AGENT_DESCRIPTION = os.environ.get(
+    "SAID_AGENT_DESCRIPTION",
+    "SOLGPT autonomous x402 desk agent. Pays Venice inference and SAID trust screens in USDC per call from its own Solana wallet.",
+)
+SAID_SCREEN_MAX_ATOMIC = 10_000
 
 # Hard filters — same defaults as server/x402-agent/engine.ts
 TRADE_SIZE_SOL = float(os.environ.get("X402_TRADE_SIZE_SOL", "0.05"))
@@ -111,6 +119,14 @@ signer = KeypairSigner.from_base58(_key) if _key else KeypairSigner(Keypair())
 
 print(f"wallet {signer.address}")
 print("funded" if _key else "disposable, cannot pay yet")
+
+
+class SaidPaymentWall(RuntimeError):
+    """402 from SAID /api/screen — the trust screen is an x402 resource."""
+
+    def __init__(self, required):
+        self.required = required
+        super().__init__("SAID trust screen requires x402 USDC payment")
 
 
 class InferencePaymentWall(RuntimeError):
@@ -635,6 +651,150 @@ def _validated_execution_snapshot(snapshot: dict) -> tuple[int, int, float]:
     return trades_today, min(MAX_TRADES_PER_DAY, remote_cap), sol_balance
 
 
+def said_headers() -> dict[str, str]:
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if SAID_API_KEY:
+        headers["X-API-Key"] = SAID_API_KEY
+    return headers
+
+
+def decode_payment_required(header: str | None, body=None):
+    raw = str(header or "").strip()
+    if raw:
+        try:
+            payload = raw if raw.startswith("{") else base64.b64decode(raw).decode()
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict) and isinstance(parsed.get("accepts"), list):
+                return parsed
+        except (ValueError, json.JSONDecodeError, TypeError):
+            pass
+    if isinstance(body, dict) and isinstance(body.get("accepts"), list):
+        return body
+    return None
+
+
+def _said_screen_rail(required: dict):
+    accepts = required.get("accepts") if isinstance(required, dict) else None
+    matches = [
+        option
+        for option in (accepts or [])
+        if isinstance(option, dict)
+        and str(option.get("scheme")) == "exact"
+        and str(option.get("network")) == NETWORK
+        and str(option.get("asset")) == USDC_MINT
+        and isinstance(option.get("extra"), dict)
+        and option["extra"].get("feePayer")
+    ]
+    if not matches:
+        raise RuntimeError("SAID screen did not offer exact USDC on the configured Solana mainnet network")
+    rail = matches[0]
+    try:
+        amount_atomic = int(rail["amount"])
+    except (TypeError, ValueError, KeyError) as exc:
+        raise RuntimeError("SAID screen rail amount is not an integer") from exc
+    if amount_atomic <= 0 or amount_atomic > SAID_SCREEN_MAX_ATOMIC:
+        raise RuntimeError(
+            f"SAID screen asks for {amount_atomic} atomic USDC; cap is {SAID_SCREEN_MAX_ATOMIC}"
+        )
+    try:
+        Pubkey.from_string(str(rail["payTo"]))
+        Pubkey.from_string(str(rail["extra"]["feePayer"]))
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError("SAID screen rail has an invalid Solana payTo or feePayer") from exc
+    return rail
+
+
+def said_register(name: str = SAID_AGENT_NAME, description: str = SAID_AGENT_DESCRIPTION):
+    response = requests.post(
+        f"{SAID_API_BASE}/api/register/pending",
+        headers=said_headers(),
+        json={
+            "wallet": str(signer.address),
+            "name": name,
+            "description": description,
+            "website": "https://solgpt.us",
+            "capabilities": ["trading", "x402", "pump-tape"],
+            "source": "sdk",
+        },
+        timeout=30,
+        allow_redirects=False,
+    )
+    _require_2xx(response, "SAID register")
+    return response.json()
+
+
+def said_verify(wallet: str | None = None):
+    address = wallet or str(signer.address)
+    response = requests.get(
+        f"{SAID_API_BASE}/api/verify/{address}",
+        headers=said_headers(),
+        timeout=30,
+        allow_redirects=False,
+    )
+    _require_2xx(response, "SAID verify")
+    return response.json()
+
+
+def should_block_counterparty(verdict) -> bool:
+    return str(verdict or "").strip().lower() == "caution"
+
+
+def said_screen(wallet: str, *, pay: bool = False):
+    """Unpaid discovery first; optionally settle the Solana USDC rail once."""
+    address = _validated_mint(wallet)
+    response = requests.get(
+        f"{SAID_API_BASE}/api/screen",
+        params={"wallet": address},
+        headers=said_headers(),
+        timeout=30,
+        allow_redirects=False,
+    )
+    if response.status_code != 402:
+        _require_2xx(response, "SAID screen")
+        body = _response_json(response, {})
+        return {
+            "ok": True,
+            "paid": False,
+            "verdict": str((body or {}).get("verdict") or "").lower() or None,
+            "body": body,
+        }
+
+    required = decode_payment_required(
+        response.headers.get("payment-required") or response.headers.get("PAYMENT-REQUIRED"),
+        _response_json(response, {}),
+    )
+    if not required:
+        raise SaidPaymentWall(None)
+    rail = _said_screen_rail(required)
+    if not pay:
+        raise SaidPaymentWall(required)
+
+    client = x402ClientSync()
+    client.register(NETWORK, ExactSvmScheme(signer))
+    client.set_spend_controls(SpendControls(max_amount_per_payment="$0.01"))
+    selected = PaymentRequired.model_validate({**required, "accepts": [rail]})
+    payload = client.create_payment_payload(selected)
+    settlement = requests.get(
+        f"{SAID_API_BASE}/api/screen",
+        params={"wallet": address},
+        headers={
+            **said_headers(),
+            PAYMENT_SIGNATURE_HEADER: encode_payment_signature_header(payload),
+        },
+        timeout=90,
+        allow_redirects=False,
+    )
+    _require_2xx(settlement, "SAID paid screen")
+    body = _response_json(settlement, {})
+    return {
+        "ok": True,
+        "paid": True,
+        "verdict": str((body or {}).get("verdict") or "").lower() or None,
+        "body": body,
+        "rail": {"network": rail["network"], "amount": rail["amount"], "payTo": rail["payTo"]},
+    }
+
+
 def _validate_trade_config() -> None:
     if not math.isfinite(TRADE_SIZE_SOL) or not 0 < TRADE_SIZE_SOL <= 5:
         raise ValueError("X402_TRADE_SIZE_SOL must be between 0 and 5 SOL")
@@ -765,6 +925,14 @@ def desk(budget=BUDGET_USD, execute: bool = False, refill: bool = False):
     opening = balance()
     print(f"> X402 AUTONOMOUS DESK")
     print(f"> wallet {signer.address}")
+    try:
+        identity = said_register()
+        print(
+            f"> SAID {identity.get('status') or 'PENDING'} "
+            f"{identity.get('profile') or identity.get('wallet') or signer.address}"
+        )
+    except Exception as err:
+        print(f"> SAID register skipped ({err})")
     print(f"> brain ${opening.get('balanceUsd', 0):.4f}  canConsume={opening.get('canConsume')}  budget ${budget:.4f}")
     print(
         f"> filters size {TRADE_SIZE_SOL} SOL · cap {MAX_TRADES_PER_DAY}/day · "
@@ -831,6 +999,18 @@ def desk(budget=BUDGET_USD, execute: bool = False, refill: bool = False):
         reason = hard_filters(launch, trades_today, effective_trade_cap)
         if reason:
             continue
+
+        creator = str(launch.get("creator") or "").strip()
+        if creator:
+            try:
+                screen = said_screen(creator, pay=False)
+                if should_block_counterparty(screen.get("verdict")):
+                    print(f"> SAID caution skip {launch.get('symbol') or creator[:8]}")
+                    continue
+            except SaidPaymentWall:
+                pass
+            except Exception:
+                pass
 
         mint = str(launch.get("mint"))
         if mint in seen_mints:
@@ -924,6 +1104,9 @@ def main(argv: list[str] | None = None):
         help="session inference cap in USD",
     )
     parser.add_argument("--status", action="store_true", help="print Venice balance JSON (default)")
+    parser.add_argument("--said-register", action="store_true", help="register this wallet on SAID (off-chain, free)")
+    parser.add_argument("--said-screen", metavar="WALLET", help="x402 trust-screen a counterparty wallet")
+    parser.add_argument("--pay-screen", action="store_true", help="with --said-screen, settle the 0.001 USDC rail")
     args = parser.parse_args(argv)
 
     global AUTO_REFILL
@@ -933,6 +1116,15 @@ def main(argv: list[str] | None = None):
     if args.top_up:
         print(top_up())
         return
+    if args.said_register:
+        print(json.dumps(said_register(), indent=2))
+        return
+    if args.said_screen:
+        try:
+            print(json.dumps(said_screen(args.said_screen, pay=args.pay_screen), indent=2, default=str))
+        except SaidPaymentWall as wall:
+            print(json.dumps({"ok": False, "status": 402, "error": str(wall), "required": wall.required}, indent=2, default=str))
+        return
     if args.demo:
         run(budget=args.budget)
         return
@@ -940,6 +1132,10 @@ def main(argv: list[str] | None = None):
         desk(budget=args.budget, execute=args.execute, refill=args.refill)
         return
     print_status()
+    try:
+        print(json.dumps(said_verify(), indent=2))
+    except Exception as err:
+        print(f"SAID status skipped ({err})")
 
 
 if __name__ == "__main__":

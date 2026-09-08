@@ -193,6 +193,19 @@ Top-up-specific safety knobs:
 
 `--execute` does **not** sign swaps in Python. It asks the TypeScript engine to buy, so TP/SL, soul autopsies, and the encrypted keystore stay in one place.
 
+## SAID identity
+
+The same wallet is a SAID agent. Off-chain registration is free; the trust screen is an x402 resource (0.001 USDC on Solana mainnet USDC). `SAID_API_KEY` is sent as `X-API-Key` on every SAID request when set.
+
+```bash
+SAID_API_KEY=… python agent.py --said-register
+python agent.py --said-screen COUNTERPARTY_WALLET          # stops at the 402 wall
+python agent.py --said-screen COUNTERPARTY_WALLET --pay-screen
+python agent.py --desk                                     # registers, then screens creators
+```
+
+`--desk` registers the inference wallet at `POST /api/register/pending`, then skips launches whose creator SAID screen returns `caution`. An unpaid 402 is not a skip — screening is best-effort until the wallet can pay.
+
 The relay payload is untrusted. A launch must contain a valid Solana mint, repeated mints are deduplicated, and the model is explicitly told never to treat token metadata as instructions. A desk response counts as a fill only when it has `ok: true` and a transaction signature.
 
 ## Pump program scope
@@ -209,6 +222,8 @@ python agent.py --demo          # original $5 CS-question budget loop
 python agent.py --top-up        # settle a Solana USDC top-up
 python agent.py --desk          # autonomous desk: tape → verdicts, no trades
 python agent.py --desk --execute --budget 0.01
+SAID_API_KEY=… python agent.py --said-register
+python agent.py --said-screen COUNTERPARTY_WALLET
 ```
 
 Then fund via `top_up()` / `--top-up` and run the loop:
